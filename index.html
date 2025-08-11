@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Monitoreo de Incendios en Argentina</title>
+  <link href="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.css" rel="stylesheet" />
+  <style>
+    html, body { margin:0; padding:0; height:100%; width:100%; font-family:system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+    #map { position:absolute; top:0; bottom:0; width:100%; }
+    #controls { position:absolute; top:10px; left:10px; z-index:1; background:rgba(255,255,255,0.9); padding:8px 12px; border-radius:4px; box-shadow:0 0 5px rgba(0,0,0,.25); font-size:14px; }
+    #controls select, #controls label { margin-right:6px; }
+    #info { position:absolute; bottom:10px; left:10px; z-index:1; background:rgba(255,255,255,0.9); padding:8px 12px; border-radius:4px; box-shadow:0 0 5px rgba(0,0,0,.25); font-size:14px; }
+  </style>
+</head>
+<body>
+  <div id="map" aria-label="Mapa de incendios"></div>
+  <div id="controls">
+    <label for="timeWindow">Ventana:</label>
+    <select id="timeWindow" aria-label="Seleccionar ventana temporal">
+      <option value="24h" selected>Últimas 24h</option>
+      <option value="today">Hoy</option>
+      <option value="3d">3&nbsp;días</option>
+      <option value="7d">7&nbsp;días</option>
+    </select>
+    <label><input type="checkbox" id="heatmapToggle" /> Heatmap</label>
+  </div>
+  <div id="info">
+    <strong>Total:</strong> <span id="count">0</span> &nbsp;|&nbsp;
+    <strong>Última actualización:</strong> <span id="lastUpdate">–</span>
+  </div>
+
+  <script src="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.js"></script>
+  <script>
+    // Rutas relativas a archivos locales generados por el ETL
+    const FILES = {
+      "today": "fires_today.json",
+      "24h":   "fires_24h.json",
+      "3d":    "fires_3d.json",
+      "7d":    "fires_7d.json"
+    };
+
+    const map = new maplibregl.Map({
+      container: 'map',
+      style: 'https://demotiles.maplibre.org/style.json',
+      center: [-64.188776, -34.756118],
+      zoom: 3.5
+    });
+    map.addControl(new maplibregl.NavigationControl());
+
+    const timeSelector = document.getElementById('timeWindow');
+    const heatmapToggle = document.getElementById('heatmapToggle');
+    const countSpan = document.getElementById('count');
+    const lastUpdateSpan = document.getElementById('lastUpdate');
+
+    async function fetchLocalGeoJSON(window) {
+      const path = FILES[window] || FILES["24h"];
+      const resp = await fetch(path, { cache: 'no-store' });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      return await resp.json();
+    }
+
+    function updateLayers(geojson) {
+      // actualizar UI
+      countSpan.textContent = geojson.meta?.count ?? 0;
+      lastUpdateSpan.textContent = geojson.meta?.last_update
+        ? new Date(geojson.meta.last_update).toLocaleString()
+        : '–';
+
+      const sourceId = 'fires';
+      if (map.getSource(sourceId)) {
+        map.getSource(sourceId).setData(geojson);
+        return;
+      }
+
+      map.addSource(sourceId, {
+        type: 'geojson',
+        data: geojson,
+        cluster: true,
+        clusterRadius: 50,
+        clusterMaxZoom: 9
+      });
+
+      map.addLayer({
+        id: 'clusters',
+        type: 'circle',
+        source: sourceId,
+        filter: ['has', 'point_count'],
+        paint: {
+          'circle-color': [
+            'step', ['get', 'point_count'],
+            '#ffffb2', 10, '#fecc5c',
+            50, '#fd8d3c', 100, '#f03b20',
+            500, '#bd0026'
+          ],
+          'circle-radius': [
+            'step', ['get', 'point_count'],
+            12, 10, 16, 50, 20, 100, 24, 500, 28
+          ]
+        }
+      });
+
+      map.addLayer({
+        id: 'cluster-count',
+        type: 'symbol',
+        source: sourceId,
+        filter: ['has', 'point_count'],
+        layout: { 'text-field': '{point_count_abbreviated}', 'text-size': 12 }
+      });
+
+      map.addLayer({
+        id: 'unclustered-point',
+        type: 'circle',
+        source: sourceId,
+        filter: ['!', ['has', 'point_count']],
+        paint: {
+          'circle-color': [
+            'match', ['get', 'daynight'],
+            'D', '#ff7800',
+            'N', '#3182bd',
+            '#31a354'
+          ],
+          'circle-radius': 5,
+          'circle-stroke-color': '#000',
+          'circle-stroke-width': 0.5
+        }
+      });
+
+      map.on('click', 'unclustered-point', (e) => {
+        const f = e.features[0];
+        const p = f.properties;
+        new maplibregl.Popup()
+          .setLngLat(f.geometry.coordinates)
+          .setHTML(`<div style="font-size:12px;">
+            <strong>Fecha (local)</strong>: ${p.timestamp_local ? new Date(p.timestamp_local).toLocaleString() : '–'}<br/>
+            <strong>Sensor</strong>: ${p.source ?? '–'}<br/>
+            <strong>Satélite</strong>: ${p.satellite ?? '–'}<br/>
+            <strong>Confianza</strong>: ${p.confidence ?? '–'}<br/>
+            <strong>FRP</strong>: ${p.frp ?? '–'}
+          </div>`)
+          .addTo(map);
+      });
+
+      map.on('mouseenter', 'unclustered-point', () => map.getCanvas().style.cursor = 'pointer');
+      map.on('mouseleave', 'unclustered-point', () => map.getCanvas().style.cursor = '');
+      map.on('mouseenter', 'clusters', () => map.getCanvas().style.cursor = 'pointer');
+      map.on('mouseleave', 'clusters', () => map.getCanvas().style.cursor = '');
+      map.on('click', 'clusters', (e) => {
+        const features = map.queryRenderedFeatures(e.point, { layers: ['clusters'] });
+        const clusterId = features[0].properties.cluster_id;
+        map.getSource('fires').getClusterExpansionZoom(clusterId, (err, zoom) => {
+          if (err) return;
+          map.easeTo({ center: features[0].geometry.coordinates, zoom });
+        });
+      });
+
+      map.addLayer({
+        id: 'heatmap',
+        type: 'heatmap',
+        source: 'fires',
+        maxzoom: 9,
+        layout: { visibility: heatmapToggle.checked ? 'visible' : 'none' },
+        paint: {
+          'heatmap-weight': ['interpolate', ['linear'], ['get', 'frp'], 0, 0, 100, 1],
+          'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 0, 1, 9, 3],
+          'heatmap-color': [
+            'interpolate', ['linear'], ['heatmap-density'],
+            0, 'rgba(0,0,255,0)',
+            0.1, 'royalblue',
+            0.3, 'cyan',
+            0.5, 'lime',
+            0.7, 'yellow',
+            1, 'red'
+          ],
+          'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 0, 2, 9, 20],
+          'heatmap-opacity': 0.7
+        }
+      });
+    }
+
+    async function refreshData() {
+      try {
+        const window = timeSelector.value;
+        const geojson = await fetchLocalGeoJSON(window);
+        updateLayers(geojson);
+      } catch (e) {
+        console.error(e);
+        alert("No se pudieron cargar los datos de incendios");
+      }
+    }
+
+    map.on('load', refreshData);
+    timeSelector.addEventListener('change', refreshData);
+    heatmapToggle.addEventListener('change', () => {
+      if (map.getLayer('heatmap')) {
+        map.setLayoutProperty('heatmap', 'visibility', heatmapToggle.checked ? 'visible' : 'none');
+      }
+    });
+  </script>
+</body>
+</html>
