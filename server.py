@@ -1,6 +1,6 @@
 # server.py
 # ETL + API FIRMS (Argentina) con FastAPI + SQLite + GeoJSON estático
-# Fuentes oficiales: VIIRS_SNPP_NRT, VIIRS_NOAA20_NRT, VIIRS_NOAA21_NRT, MODIS_NRT
+# Fuentes: VIIRS_SNPP_NRT, VIIRS_NOAA20_NRT, VIIRS_NOAA21_NRT, MODIS_NRT
 # Endpoints:
 #   - GET /health
 #   - GET /refresh?sensors=...&day_range=1..10
@@ -14,13 +14,26 @@ import json
 import time
 import sqlite3
 import asyncio
+import logging
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+# =========================
+# Logging
+# =========================
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("firms-api")
 
 # =========================
 # Configuración (ENV)
@@ -34,8 +47,7 @@ if not FIRMS_MAP_KEY:
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN")  # opcional
 
 COUNTRY = os.getenv("FIRMS_COUNTRY", "ARG").strip()
-# Por defecto 3 días para bajar el riesgo de 403; podés ajustar:
-DAY_RANGE = int(os.getenv("FIRMS_DAY_RANGE", "3"))        # 1..10
+DAY_RANGE = int(os.getenv("FIRMS_DAY_RANGE", "3"))        # 1..10 (por defecto 3 días)
 CACHE_TTL_MIN = int(os.getenv("CACHE_TTL_MIN", "5"))      # TTL lógico entre refresh
 DB_PATH = os.getenv("DB_PATH", "fires.db")
 OUT_DIR = os.getenv("OUT_DIR", ".")                       # donde escribir fires_*.json
@@ -45,6 +57,26 @@ DEFAULT_SENSORS = "VIIRS_SNPP_NRT,VIIRS_NOAA20_NRT,VIIRS_NOAA21_NRT,MODIS_NRT"
 SENSORS = [s.strip() for s in os.getenv("FIRMS_SENSORS", DEFAULT_SENSORS).split(",") if s.strip()]
 
 TZ_AR = ZoneInfo("America/Argentina/Buenos_Aires")
+
+# =========================
+# HTTP Session con reintentos
+# =========================
+_session = requests.Session()
+_retry = Retry(
+    total=5,
+    connect=3,
+    read=3,
+    status=5,
+    status_forcelist=(403, 429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET"]),
+    backoff_factor=2,  # 0, 2, 4, 8, 16s...
+    respect_retry_after_header=True,
+)
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+_session.headers.update({"User-Agent": "FIRMS-ARG-ETL/1.0 (+FastAPI)"})
+
 
 # =========================
 # SQLite (esquema)
@@ -139,7 +171,8 @@ def get_meta(conn: sqlite3.Connection, k: str) -> Optional[str]:
 
 def last_refresh_dt(conn: sqlite3.Connection) -> Optional[datetime]:
     v = get_meta(conn, "last_refresh_utc")
-    if not v: return None
+    if not v:
+        return None
     try:
         return datetime.fromisoformat(v.replace("Z", "+00:00"))
     except Exception:
@@ -152,17 +185,39 @@ def fetch_csv(source: str, country: str, day_range: int, retries: int = 4, backo
     url = f"https://firms.modaps.eosdis.nasa.gov/api/country/csv/{FIRMS_MAP_KEY}/{source}/{country}/{day_range}"
     attempt = 0
     while True:
-        r = requests.get(url, timeout=60)
-        if r.status_code in (403, 429):
+        try:
+            # timeout=(connect, read)
+            r = _session.get(url, timeout=(10, 60))
+        except requests.exceptions.Timeout as e:
+            attempt += 1
+            if attempt > retries:
+                raise RuntimeError(f"FIRMS timeout tras {retries} reintentos: {e}")
+            wait = backoff_sec * attempt
+            log.warning(f"{source} timeout. Reintentando en {wait}s (intento {attempt}/{retries})")
+            time.sleep(wait)
+            continue
+        except requests.exceptions.RequestException as e:
+            attempt += 1
+            if attempt > retries:
+                raise RuntimeError(f"FIRMS error de red tras {retries} reintentos: {e}")
+            wait = backoff_sec * attempt
+            log.warning(f"{source} error de red. Reintentando en {wait}s (intento {attempt}/{retries})")
+            time.sleep(wait)
+            continue
+
+        if r.status_code in (403, 429, 500, 502, 503, 504):
             attempt += 1
             if attempt > retries:
                 raise RuntimeError(f"FIRMS {r.status_code}: {r.text[:200]}")
             wait = backoff_sec * attempt
-            print(f"[WARN] {source} rate-limit {r.status_code}. Reintentando en {wait}s (intento {attempt}/{retries})")
+            log.warning(f"{source} {r.status_code}. Reintentando en {wait}s (intento {attempt}/{retries})")
             time.sleep(wait)
             continue
+
         if r.status_code >= 400:
+            # otros 4xx: no reintentar
             raise RuntimeError(f"FIRMS {r.status_code}: {r.text[:200]}")
+
         return r.text
 
 def csv_to_rows(csv_text: str, source: str) -> List[Dict[str, Any]]:
@@ -182,8 +237,10 @@ def csv_to_rows(csv_text: str, source: str) -> List[Dict[str, Any]]:
         conf_n = confidence_to_float(conf)
         frp_val = None
         if r.get("frp") not in (None, "", "null"):
-            try: frp_val = float(r.get("frp"))
-            except Exception: frp_val = None
+            try:
+                frp_val = float(r.get("frp"))
+            except Exception:
+                frp_val = None
         rows.append({
             "source": source,
             "latitude": latf,
@@ -204,7 +261,8 @@ def csv_to_rows(csv_text: str, source: str) -> List[Dict[str, Any]]:
     return rows
 
 def upsert_rows(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> int:
-    if not rows: return 0
+    if not rows:
+        return 0
     sql = """
     INSERT OR IGNORE INTO fires
     (source, latitude, longitude, acq_date, acq_time, timestamp_utc, timestamp_local,
@@ -216,32 +274,85 @@ def upsert_rows(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> int:
         conn.executemany(sql, rows)
     return len(rows)
 
-def refresh_all(conn: sqlite3.Connection, sensors: List[str], day_range: int, pause_sec: int = 10) -> Dict[str, Any]:
+def refresh_all(
+    conn: sqlite3.Connection,
+    sensors: List[str],
+    day_range: int,
+    pause_sec: int = 10,
+    dump_after_each: bool = False,
+    log_progress: bool = False,
+    prioritize_modis: bool = True,
+) -> Dict[str, Any]:
     ensure_schema(conn)
-    # Guardián TTL (para no abusar)
+    # TTL (para no abusar)
     lr = last_refresh_dt(conn)
-    if lr and (datetime.now(timezone.utc) - lr) < timedelta(minutes=CACHE_TTL_MIN):
-        return {"status":"skip","reason":f"ya refrescado hace < {CACHE_TTL_MIN} min","last_refresh_utc":lr.isoformat().replace("+00:00","Z")}
+    now_utc_dt = datetime.now(timezone.utc)
+    now_iso = now_utc_dt.isoformat().replace("+00:00","Z")
+    set_meta(conn, "last_attempt_utc", now_iso)
 
+    if lr and (now_utc_dt - lr) < timedelta(minutes=CACHE_TTL_MIN):
+        return {"status": "skip", "reason": f"ya refrescado hace < {CACHE_TTL_MIN} min", "last_refresh_utc": lr.isoformat().replace("+00:00","Z")}
+
+    # Prioridad: MODIS primero si está en la lista
+    ordered = sensors[:]
+    if prioritize_modis and "MODIS_NRT" in ordered:
+        ordered = ["MODIS_NRT"] + [s for s in ordered if s != "MODIS_NRT"]
+
+    total = len(ordered)
+    completed: List[str] = []
     added_total = 0
     detail = []
-    for i, s in enumerate(sensors):
+
+    log.info(f"[ETL] Comenzando refresh: sensores={ordered}, day_range={day_range}")
+
+    for i, s in enumerate(ordered, start=1):
+        pending = ordered[i:]  # lo que queda a futuro
+        if log_progress:
+            log.info(f"[ETL][{i}/{total}] {s} → descargando (day_range={day_range}) | pendientes: {pending or 'ninguno'}")
+
         try:
             txt = fetch_csv(s, COUNTRY, day_range)
             rows = csv_to_rows(txt, s)
             n = upsert_rows(conn, rows)
             added_total += n
+            completed.append(s)
             detail.append({"sensor": s, "rows_parsed": len(rows), "rows_inserted": n})
+            log.info(f"[ETL][{s}] ok parsed={len(rows)} inserted={n}")
+
+            # Dump parcial: si insertó algo, actualizamos archivos para que el front vea progreso
+            if dump_after_each and n > 0:
+                try:
+                    dump_all_geojson(conn, OUT_DIR)
+                    log.info(f"[ETL][{s}] GeoJSON actualizado (dump parcial).")
+                except Exception as e:
+                    log.warning(f"[dump-parcial][{s}] {e}")
+
         except RuntimeError as e:
             detail.append({"sensor": s, "error": str(e)})
-        if i < len(sensors)-1:
+            log.warning(f"[ETL][{s}] {e}")
+        except Exception as e:
+            detail.append({"sensor": s, "error": f"unexpected: {e}"})
+            log.exception(f"[ETL][{s}] unexpected error")
+
+        # Informe de progreso luego de cada sensor
+        if log_progress:
+            log.info(f"[ETL] completados: {completed or ['ninguno']} | pendientes: {ordered[i:] or ['ninguno']}")
+
+        if i < total:
             time.sleep(max(0, pause_sec))
 
-    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+    # Sólo sellamos last_refresh_utc si hubo inserciones
     if added_total > 0:
         set_meta(conn, "last_refresh_utc", now_iso)
 
-    return {"status": "ok" if added_total>0 else "no_data", "inserted": added_total, "detail": detail, "last_refresh_utc": now_iso}
+    return {
+        "status": "ok" if added_total > 0 else "no_data",
+        "inserted": added_total,
+        "detail": detail,
+        "last_refresh_utc": get_meta(conn, "last_refresh_utc"),
+        "completed": completed,
+        "pending": [s for s in ordered if s not in completed],
+    }
 
 # =========================
 # Export a GeoJSON estático
@@ -277,10 +388,14 @@ def dump_geojson(conn: sqlite3.Connection, window: str, out_path: str) -> Dict[s
             "version": version,
             "daynight": daynight
         }
-        features.append({"type":"Feature","geometry":{"type":"Point","coordinates":[lon,lat]},"properties":props})
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [lon, lat]},
+            "properties": props
+        })
 
     geo = {
-        "type":"FeatureCollection",
+        "type": "FeatureCollection",
         "features": features,
         "meta": {
             "count": len(features),
@@ -303,21 +418,28 @@ def dump_all_geojson(conn: sqlite3.Connection, out_dir: str = OUT_DIR) -> Dict[s
     outputs["7d"]   = dump_geojson(conn, "7d",   os.path.join(out_dir, "fires_7d.json"))
     return outputs
 
-
 # --- Tarea en background para reintentar MODIS cada 10 minutos ---
 async def retry_modis_background():
     while True:
         try:
             conn = get_conn()
-            res = refresh_all(conn, ["MODIS_NRT"], day_range=1, pause_sec=0)
-            if res.get("inserted", 0) > 0:
-                dump_all_geojson(conn, OUT_DIR)
-                print("[MODIS] Ingresaron datos. Deteniendo reintentos.")
+            res = await asyncio.to_thread(
+                refresh_all,
+                conn,
+                ["MODIS_NRT"],
+                day_range=1,
+                pause_sec=0,
+                dump_after_each=True,
+                log_progress=True,
+                prioritize_modis=False,
+            )
+            if (res or {}).get("inserted", 0) > 0:
+                await asyncio.to_thread(dump_all_geojson, conn, OUT_DIR)
+                log.info("[MODIS] Ingresaron datos. Deteniendo reintentos.")
                 return
         except Exception as e:
-            print(f"[MODIS][retry] {e}")
+            log.warning(f"[MODIS][retry] {e}")
         await asyncio.sleep(600)  # 10 min
-
 
 # =========================
 # FastAPI (API)
@@ -341,29 +463,71 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     """
-    Lanza el ETL inicial en background y arranca un reintento
-    automático de MODIS cada 10 minutos hasta que entre.
+    Arranca con un seed rápido (MODIS, 1 día) para tener puntos cuanto antes,
+    y luego corre el ETL completo con el resto de sensores. Ambos en background.
     """
-    print("[INIT] ETL inicial en background…")
+    log.info("[INIT] ETL inicial en background…")
     conn = get_conn()
     ensure_schema(conn)
 
-    async def boot_etl():
+    async def seed_fast():
         try:
-            _ = refresh_all(conn, SENSORS, DAY_RANGE, pause_sec=10)
-            dump_all_geojson(conn, OUT_DIR)
-            print("[INIT] ETL inicial OK.")
+            # Seed: MODIS día 1 (rápido) + dump parcial
+            await asyncio.to_thread(
+                refresh_all,
+                conn,
+                ["MODIS_NRT"],
+                day_range=1,
+                pause_sec=0,
+                dump_after_each=True,
+                log_progress=True,
+                prioritize_modis=False,
+            )
+            await asyncio.to_thread(dump_all_geojson, conn, OUT_DIR)
+            log.info("[INIT][SEED] Listo.")
         except Exception as e:
-            print(f"[INIT][WARN] ETL inicial falló: {e}")
+            log.warning(f"[INIT][SEED] {e}")
 
-    # No bloquea el arranque del servidor
-    asyncio.create_task(boot_etl())
+    async def full_etl():
+        try:
+            # ETL completo con la config real
+            await asyncio.to_thread(
+                refresh_all,
+                conn,
+                SENSORS,
+                DAY_RANGE,
+                pause_sec=10,
+                dump_after_each=True,
+                log_progress=True,
+                prioritize_modis=True,
+            )
+            await asyncio.to_thread(dump_all_geojson, conn, OUT_DIR)
+            log.info("[INIT][FULL] ETL inicial OK.")
+        except Exception as e:
+            log.warning(f"[INIT][FULL] {e}")
+
+    # Correr ambas tareas en paralelo (seed rápido + full)
+    asyncio.create_task(seed_fast())
+    asyncio.create_task(full_etl())
+
+    # Reintento de MODIS (se conserva)
     asyncio.create_task(retry_modis_background())
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "time_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+    with get_conn() as conn:
+        last_refresh = get_meta(conn, "last_refresh_utc")
+        last_attempt = get_meta(conn, "last_attempt_utc")
+        total = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fires'").fetchone()[0]
+        rows = conn.execute("SELECT COUNT(*) FROM fires").fetchone()[0] if total else 0
+    return {
+        "ok": True,
+        "time_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "last_refresh_utc": last_refresh,
+        "last_attempt_utc": last_attempt,
+        "rows": rows
+    }
 
 @app.get("/refresh")
 def refresh_endpoint(sensors: Optional[str] = None, day_range: Optional[int] = None, pause_sec: int = 10):
@@ -377,30 +541,39 @@ def refresh_endpoint(sensors: Optional[str] = None, day_range: Optional[int] = N
         raise HTTPException(400, "day_range debe ser entre 1 y 10.")
     conn = get_conn()
     res = refresh_all(conn, used, dr, pause_sec=pause_sec)
-    dump_all_geojson(conn, OUT_DIR)
+    try:
+        dump_all_geojson(conn, OUT_DIR)
+    except Exception as e:
+        # No romper aunque fallara el volcado
+        log.warning(f"[dump] {e}")
     return res
 
 @app.get("/fires")
-def get_fires(window: str = Query("24h", pattern="^(today|24h|3d|7d)$"),
-              limit: int = Query(50000, ge=1, le=200000)) -> Dict[str, Any]:
+def get_fires(
+    window: str = Query("24h", pattern="^(today|24h|3d|7d)$"),
+    limit: int = Query(50000, ge=1, le=200000)
+) -> Dict[str, Any]:
     """
     Devuelve GeoJSON unificado desde SQLite según ventana temporal.
     (Sigue generando archivos estáticos por si querés servirlos directo.)
     """
     col, start_iso, end_iso = window_to_bounds(window)
-    conn = get_conn()
-    exists = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fires'").fetchone()[0]
-    if not exists:
-        raise HTTPException(503, "La base está vacía. Ejecutá /refresh primero.")
-    sql = f"""
-    SELECT source, latitude, longitude, acq_date, acq_time, timestamp_utc, timestamp_local,
-           satellite, instrument, confidence, confidence_n, frp, version, daynight
-    FROM fires
-    WHERE {col} >= ? AND {col} <= ?
-    ORDER BY timestamp_utc DESC
-    LIMIT ?
-    """
-    rows = list(conn.execute(sql, (start_iso, end_iso, limit)))
+    with get_conn() as conn:
+        exists = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fires'"
+        ).fetchone()[0]
+        if not exists:
+            raise HTTPException(503, "La base está vacía. Ejecutá /refresh primero.")
+        sql = f"""
+        SELECT source, latitude, longitude, acq_date, acq_time, timestamp_utc, timestamp_local,
+               satellite, instrument, confidence, confidence_n, frp, version, daynight
+        FROM fires
+        WHERE {col} >= ? AND {col} <= ?
+        ORDER BY timestamp_utc DESC
+        LIMIT ?
+        """
+        rows = list(conn.execute(sql, (start_iso, end_iso, limit)))
+
     features = []
     last_update = None
     for r in rows:
@@ -422,9 +595,13 @@ def get_fires(window: str = Query("24h", pattern="^(today|24h|3d|7d)$"),
             "version": version,
             "daynight": daynight
         }
-        features.append({"type":"Feature","geometry":{"type":"Point","coordinates":[lon,lat]},"properties":props})
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [lon, lat]},
+            "properties": props
+        })
     return {
-        "type":"FeatureCollection",
+        "type": "FeatureCollection",
         "features": features,
         "meta": {
             "count": len(features),

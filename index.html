@@ -5,14 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Monitoreo de Incendios en Argentina</title>
   <link href="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.css" rel="stylesheet" />
+  <link rel="icon" href="data:,">
   <style>
     html, body { margin:0; padding:0; height:100%; width:100%; font-family:system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; }
     #map { position:absolute; inset:0; }
     #controls, #info { position:absolute; z-index:1; background:rgba(255,255,255,.95); padding:8px 12px; border-radius:8px; box-shadow:0 2px 12px rgba(0,0,0,.12); font-size:14px; }
-    #controls { top:12px; left:12px; display:flex; gap:8px; align-items:center; }
+    #controls { top:12px; left:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     #info { bottom:12px; left:12px; }
     #controls select { padding:6px 8px; border-radius:6px; border:1px solid #ddd; }
     .brand { position:absolute; top:12px; right:12px; z-index:1; background:rgba(255,255,255,.95); padding:6px 10px; border-radius:8px; box-shadow:0 2px 12px rgba(0,0,0,.12); font-size:12px; }
+    label { user-select:none; }
   </style>
 </head>
 <body>
@@ -27,6 +29,9 @@
       <option value="7d">7 días</option>
     </select>
     <label><input type="checkbox" id="heatmapToggle" /> Heatmap</label>
+    <span style="margin-left:8px;">Confianza:</span>
+    <label><input type="checkbox" id="filterHigh" checked /> Alta (≥60)</label>
+    <label><input type="checkbox" id="filterLow" checked /> Baja (&lt;60)</label>
   </div>
 
   <div class="brand">Fuente: NASA FIRMS (LANCE), NASA EOSDIS</div>
@@ -39,10 +44,16 @@
 
   <script src="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.js"></script>
   <script>
-    // Autodetecta backend en Codespaces: 8080 → 8000
-    const BACKEND_URL = location.origin.replace("8080", "8000");
+    // BACKEND_URL robusto (Codespaces y local)
+    const BACKEND_URL = (() => {
+      const { protocol, hostname, origin } = location;
+      return hostname.endsWith('.app.github.dev')
+        ? `${protocol}//${hostname.replace(/-\d+\.app\.github\.dev$/, '-8000.app.github.dev')}`
+        : origin.replace(/:8080$/, ':8000');
+    })();
+    console.log('BACKEND_URL =', BACKEND_URL);
 
-    // Estilo base vacío; inyectaremos el raster “Google-like”
+    // Estilo base vacío; inyectaremos Carto Voyager (raster)
     const baseStyle = { version: 8, glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf", sources: {}, layers: [] };
 
     const map = new maplibregl.Map({
@@ -53,8 +64,14 @@
     });
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }));
 
+    // Errores
+    map.on('error', e => console.error('Map error:', e && (e.error || e)));
+    window.addEventListener('error', e => console.error('JS error:', e.message || e.error));
+
     const timeSelector = document.getElementById('timeWindow');
     const heatmapToggle = document.getElementById('heatmapToggle');
+    const filterHigh = document.getElementById('filterHigh');
+    const filterLow  = document.getElementById('filterLow');
     const countSpan = document.getElementById('count');
     const lastUpdateSpan = document.getElementById('lastUpdate');
 
@@ -74,54 +91,102 @@
             "https://d.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png"
           ];
 
-      map.addSource('carto-voyager', {
-        type: 'raster',
-        tiles,
-        tileSize: 256,
-        attribution:
-          '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OSM</a> contributors, ' +
-          '© <a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a>'
-      });
-
+      map.addSource('carto-voyager', { type: 'raster', tiles, tileSize: 256,
+        attribution: '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OSM</a> contributors, © <a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a>' });
       map.addLayer({ id: 'basemap', type: 'raster', source: 'carto-voyager', minzoom: 0, maxzoom: 20 });
 
       refreshData(); // primera carga de datos
     });
 
+    // Cancelación de fetches
+    let inflight = null;
+
     async function fetchFireData(window) {
       try {
-        const resp = await fetch(`${BACKEND_URL}/fires?window=${window}`, { cache: 'no-store' });
+        if (inflight) inflight.abort();
+        inflight = new AbortController();
+        const url = `${BACKEND_URL}/fires?window=${encodeURIComponent(window)}`;
+        const resp = await fetch(url, { cache: 'no-store', signal: inflight.signal });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
         return await resp.json();
       } catch (err) {
+        if (err.name === 'AbortError') return null;
         console.error('Error al recuperar datos:', err);
         alert('No se pudieron cargar los datos de incendios');
         return null;
+      } finally {
+        inflight = null;
       }
     }
 
-    function updateLayers(data) {
-      if (!data) return;
+    function validateGeoJSON(fc) {
+      if (!fc || fc.type !== 'FeatureCollection') return null;
+      if (!Array.isArray(fc.features)) fc.features = [];
+      return fc;
+    }
 
-      countSpan.textContent = data.meta?.count ?? 0;
-      lastUpdateSpan.textContent = data.meta?.last_update ? new Date(data.meta.last_update).toLocaleString() : '–';
+    // Predicado actual según filtros de confianza
+    function confidencePredicate() {
+      const conf = ['coalesce', ['get','confidence_n'], 0];
+      if (filterHigh.checked && !filterLow.checked)   return ['>=', conf, 60];
+      if (!filterHigh.checked && filterLow.checked)   return ['<',  conf, 60];
+      if (filterHigh.checked && filterLow.checked)    return ['>=', conf, 0];   // todo
+      return ['==', 1, 0]; // nada
+    }
+
+    function applyConfidenceFilter() {
+      const pred = confidencePredicate();
+
+      // Puntos sueltos
+      if (map.getLayer('unclustered-point')) {
+        map.setFilter('unclustered-point', ['all', ['!', ['has','point_count']], pred]);
+      }
+      // Heatmap
+      if (map.getLayer('heatmap')) {
+        map.setFilter('heatmap', pred);
+      }
+      // Clusters: si hay filtro, los ocultamos (no respetan el predicado)
+      const showClusters = (filterHigh.checked && filterLow.checked);
+      ['clusters','cluster-count'].forEach(id => {
+        if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', showClusters ? 'visible' : 'none');
+      });
+    }
+
+    function updateLayers(data) {
+      const valid = validateGeoJSON(data);
+      if (!valid) return;
+
+      countSpan.textContent = valid.meta?.count ?? valid.features.length ?? 0;
+      lastUpdateSpan.textContent = valid.meta?.last_update ? new Date(valid.meta.last_update).toLocaleString() : '–';
 
       const sourceId = 'fires';
       if (map.getSource(sourceId)) {
-        map.getSource(sourceId).setData(data);
+        map.getSource(sourceId).setData(valid);
+        applyConfidenceFilter();
         return;
       }
 
-      map.addSource(sourceId, { type: 'geojson', data, cluster: true, clusterRadius: 50, clusterMaxZoom: 9 });
+      map.addSource(sourceId, {
+        type: 'geojson',
+        data: valid,
+        cluster: true,
+        clusterRadius: 50,
+        clusterMaxZoom: 9
+      });
 
+      // Clusters (cantidad → amarillo→naranja→rojo)
       map.addLayer({
         id: 'clusters',
         type: 'circle',
         source: sourceId,
         filter: ['has', 'point_count'],
         paint: {
-          'circle-color': ['step', ['get', 'point_count'], '#e3f2fd', 10, '#90caf9', 50, '#42a5f5', 100, '#1e88e5', 500, '#1565c0'],
-          'circle-radius': ['step', ['get', 'point_count'], 14, 10, 18, 50, 22, 100, 26, 500, 30],
+          'circle-color': ['step', ['get', 'point_count'],
+            '#fffde7', 10, '#ffe082', 50, '#ffb74d', 100, '#fb8c00', 500, '#e64a19'
+          ],
+          'circle-radius': ['step', ['get', 'point_count'],
+            14, 10, 18, 50, 22, 100, 26, 500, 30
+          ],
           'circle-stroke-color': '#ffffff',
           'circle-stroke-width': 1.2
         }
@@ -133,22 +198,29 @@
         source: sourceId,
         filter: ['has', 'point_count'],
         layout: { 'text-field': '{point_count_abbreviated}', 'text-size': 12 },
-        paint: { 'text-color': '#0d47a1' }
+        paint: { 'text-color': '#4e342e' }
       });
 
+      // Puntos sueltos (color por confianza: amarillo→rojo)
       map.addLayer({
         id: 'unclustered-point',
         type: 'circle',
         source: sourceId,
         filter: ['!', ['has', 'point_count']],
         paint: {
-          'circle-color': ['match', ['get', 'daynight'], 'D', '#ff6d00', 'N', '#1565c0', /*default*/ '#2e7d32'],
+          'circle-color': ['interpolate', ['linear'], ['coalesce', ['get','confidence_n'], 0],
+            0,  '#fff59d',   /* amarillo claro */
+            60, '#ffca28',   /* ámbar */
+            80, '#ff8f00',   /* naranja */
+            90, '#e53935'    /* rojo */
+          ],
           'circle-radius': 5,
           'circle-stroke-color': '#ffffff',
           'circle-stroke-width': 1
         }
       });
 
+      // Heatmap (peso = confianza × FRP; paleta amarilla→roja)
       map.addLayer({
         id: 'heatmap',
         type: 'heatmap',
@@ -156,25 +228,39 @@
         maxzoom: 9,
         layout: { visibility: heatmapToggle.checked ? 'visible' : 'none' },
         paint: {
-          'heatmap-weight': ['interpolate', ['linear'], ['get', 'frp'], 0, 0, 100, 1],
+          'heatmap-weight': [
+            '*',
+            ['interpolate', ['linear'], ['coalesce', ['get','confidence_n'], 0], 0, 0, 100, 1],
+            ['interpolate', ['linear'], ['coalesce', ['get','frp'], 0], 0, 0, 100, 1]
+          ],
           'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 0, 1, 9, 3],
-          'heatmap-color': ['interpolate', ['linear'], ['heatmap-density'], 0, 'rgba(0,0,0,0)', 0.1, '#e3f2fd', 0.3, '#90caf9', 0.5, '#42a5f5', 0.7, '#1e88e5', 1, '#0d47a1'],
+          'heatmap-color': ['interpolate', ['linear'], ['heatmap-density'],
+            0, 'rgba(0,0,0,0)',
+            0.2, '#ffffb2',
+            0.4, '#fed976',
+            0.6, '#fd8d3c',
+            0.8, '#f03b20',
+            1, '#bd0026'
+          ],
           'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 0, 2, 9, 24],
           'heatmap-opacity': 0.7
         }
       });
 
+      // Popup
       map.on('click', 'unclustered-point', (e) => {
-        const f = e.features[0], p = f.properties;
+        const f = e.features[0], p = f.properties || {};
         new maplibregl.Popup({ offset: 10 })
           .setLngLat(f.geometry.coordinates)
-          .setHTML(`<div style="font-size:12px;line-height:1.3;">
-            <strong>Fecha (local):</strong> ${p.timestamp_local ? new Date(p.timestamp_local).toLocaleString() : '–'}<br/>
-            <strong>Sensor:</strong> ${p.source ?? '–'}<br/>
-            <strong>Satélite:</strong> ${p.satellite ?? '–'}<br/>
-            <strong>Confianza:</strong> ${p.confidence ?? '–'}<br/>
-            <strong>FRP:</strong> ${p.frp ?? '–'}
-          </div>`)
+          .setHTML(`
+            <div style="font-size:12px;line-height:1.3;">
+              <strong>Fecha (local):</strong> ${p.timestamp_local ? new Date(p.timestamp_local).toLocaleString() : '–'}<br/>
+              <strong>Sensor:</strong> ${p.source ?? '–'}<br/>
+              <strong>Satélite:</strong> ${p.satellite ?? '–'}<br/>
+              <strong>Confianza:</strong> ${p.confidence ?? (p.confidence_n ?? '–')}<br/>
+              <strong>FRP:</strong> ${p.frp ?? '–'}
+            </div>
+          `)
           .addTo(map);
       });
 
@@ -191,12 +277,15 @@
           map.easeTo({ center: features[0].geometry.coordinates, zoom });
         });
       });
+
+      // aplicar filtros iniciales
+      applyConfidenceFilter();
     }
 
     async function refreshData() {
       const window = timeSelector.value;
       const data = await fetchFireData(window);
-      updateLayers(data);
+      if (data) updateLayers(data);
     }
 
     timeSelector.addEventListener('change', refreshData);
@@ -205,6 +294,8 @@
         map.setLayoutProperty('heatmap', 'visibility', heatmapToggle.checked ? 'visible' : 'none');
       }
     });
+    filterHigh.addEventListener('change', applyConfidenceFilter);
+    filterLow.addEventListener('change', applyConfidenceFilter);
   </script>
 </body>
 </html>
